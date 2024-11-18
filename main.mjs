@@ -5,6 +5,22 @@ import psl from 'psl';
 import whoiser from 'whoiser';
 import dns from 'node:dns/promises';
 import fs from 'fs/promises';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import pLimit from 'p-limit';
+
+const limit = pLimit(5);
+await puppeteer.use(StealthPlugin());
+// Launch browser with additional options to handle protocol errors
+const browser = await puppeteer.launch({
+  args: [
+    '--disable-gpu',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--ignore-certificate-errors',
+  ]
+});
 
 function readCSVFromStdin() {
   return new Promise((resolve) => {
@@ -20,7 +36,10 @@ function readCSVFromStdin() {
     rl.on('line', (line) => {
       csvData.push(line.split(/[ \t,;]+/));
       if (!headers) {
-        headers = csvData.shift();
+        headers = csvData.shift()
+          .map(h => h.trim())
+          .map(h => h.replace(/url/, 'Domain'));
+
       }
     });
 
@@ -32,6 +51,8 @@ function readCSVFromStdin() {
     });
   });
 };
+
+const unknownCDNS = [];
 
 // Usage example:
 const csvData = await readCSVFromStdin();
@@ -139,7 +160,7 @@ function flagIP(row) {
   return row;
 }
 
-async function flagCDN(rowpromise) {
+async function flagCDNFromDNS(rowpromise) {
   const row = await rowpromise;
   if (row.Source === 'Excluded') {
     return row;
@@ -296,20 +317,59 @@ async function enrichHTTPS(rowpromise) {
     return row;
   }
 
-  const url = new URL("https://" + row.Domain);
+  const url = "https://" + row.Domain;
 
   try {
-    // console.error('fetching', row.Domain);
-    const res = await fetch(url, { redirect: 'manual' });
-    row.HTTPStatus = res.status;
-    row.HTTPHeaders = Object.fromEntries(res.headers.entries());
+    const page = await browser.newPage();
 
-    if (res.status === 200 && row.HTTPHeaders['content-type']?.startsWith('text/html')) {
-      row.HTTPBody = await res.text();
+    // Set shorter timeout and handle common errors
+    await page.setDefaultNavigationTimeout(15000);
+
+    // Configure request interception to handle protocol errors
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      // Abort requests for resources we don't need
+      const resourceType = request.resourceType();
+      if (['image', 'stylesheet', 'font', 'script'].includes(resourceType)) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
+
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded', // Changed from networkidle2 for faster response
+      timeout: 15000,
+      followRedirect: true,
+    });
+
+    if (response) {
+      row.HTTPStatus = response.status();
+      row.HTTPHeaders = response.headers();
+
+      if (row.HTTPStatus === 200) {
+        row.HTTPBody = await page.content();
+      }
     }
+
   } catch (e) {
-    row.HTTPError = e;
+    console.error('Error fetching', url, e.message);
+    // Set status codes for common errors
+    if (e.message.includes('net::ERR_HTTP2_PROTOCOL_ERROR')) {
+      row.HTTPStatus = 502;
+      row.HTTPError = 'HTTP2 Protocol Error';
+    } else if (e.message.includes('net::ERR_CONNECTION_TIMED_OUT')) {
+      row.HTTPStatus = 504;
+      row.HTTPError = 'Connection Timeout';
+    } else if (e.message.includes('net::ERR_CONNECTION_REFUSED')) {
+      row.HTTPStatus = 503;
+      row.HTTPError = 'Connection Refused';
+    } else {
+      row.HTTPStatus = 500;
+      row.HTTPError = e.message;
+    }
   }
+
   return row;
 }
 
@@ -323,14 +383,12 @@ async function enrichHTML(rowpromise) {
     row.Source = 'Unverified';
     return row;
   }
-  if (row.HTTPBody.match(/\/media_[a-f0-9]{40}/)) {
+  if (row.HTTPBody.match(/\/media_[a-f0-9]{40}/) || row.HTTPBody.match(/    <header><\/header>\n    <main>/)) {
     row.Source = 'Helix';
     delete row.HTTPBody;
-    delete row.HTTPHeaders;
   } else if (row.HTTPBody.match(/\/etc.clientlibs\//)) {
     row.Source = 'AEM';
     delete row.HTTPBody;
-    delete row.HTTPHeaders;
   } else if (row.HTTPBody.match(/\/\.rum\/@adobe\/helix-rum-js/)) {
     row.Source = 'RUM';
   } else {
@@ -339,6 +397,98 @@ async function enrichHTML(rowpromise) {
   return row;
 }
 
+async function flagCDNFromHTTP(rowpromise) {
+  const row = await rowpromise;
+  if (row.Source === 'Excluded') {
+    return row;
+  }
+
+  if (row.CDN && !row.CDN.startsWith('Unknown')) {
+    return row;
+  }
+
+  // if there is a Server-Timing header that includes ak_p; assume Akamai
+  if (row.HTTPHeaders?.['server-timing']?.includes('ak_p')) {
+    row.CDN = 'Akamai';
+    return row;
+  }
+  // if there is a server:cloudflare header; assume Cloudflare
+  if (row.HTTPHeaders?.server?.includes('cloudflare')) {
+    row.CDN = 'Cloudflare';
+    return row;
+  }
+  // x-akamai-transformed header is set by Akamai
+  if (row.HTTPHeaders?.['x-akamai-transformed']) {
+    row.CDN = 'Akamai';
+    return row;
+  }
+  // Server: AkamaiNetStorage
+  if (row.HTTPHeaders?.server?.includes('AkamaiNetStorage')) {
+    row.CDN = 'Akamai';
+    return row;
+  }
+  // if there is any header that includes akamai in the key; assume Akamai
+  if (row.HTTPHeaders && Object.keys(row.HTTPHeaders).some(key => key.toLowerCase().includes('akamai') || row.HTTPHeaders[key]?.toLowerCase()?.includes('akamai'))) {
+    row.CDN = 'Akamai';
+    return row;
+  }
+  // x-cdn: Imperva
+  if (row.HTTPHeaders?.['x-cdn']?.includes('Imperva')) {
+    row.CDN = 'Imperva';
+    return row;
+  }
+  // x-azure-ref: Azure
+  if (row.HTTPHeaders?.['x-azure-ref']) {
+    row.CDN = 'Azure';
+    return row;
+  }
+  // Server: Cloudfront
+  if (row.HTTPHeaders?.server?.includes('CloudFront')) {
+    row.CDN = 'Cloudfront';
+    return row;
+  }
+  // akamai-x-true-cache-ttl
+  if (row.HTTPHeaders?.['akamai-x-true-cache-ttl']) {
+    row.CDN = 'Akamai';
+    return row;
+  }
+  // server: ECS is EdgeCast
+  if (row.HTTPHeaders?.server?.includes('ECS')) {
+    row.CDN = 'EdgeCast';
+    return row;
+  }
+  // x-amaz-cf-id: Amazon CloudFront
+  if (row.HTTPHeaders?.['x-amaz-cf-id']) {
+    row.CDN = 'CloudFront';
+    return row;
+  }
+  // 'x-cache': 'Hit from cloudfront'
+  if (row.HTTPHeaders?.['x-cache']?.includes(' from cloudfront')) {
+    row.CDN = 'CloudFront';
+    return row;
+  }
+
+  // Add x-served-by pattern detection
+  if (row.HTTPHeaders?.['x-served-by']) {
+    // Akamai pattern: cache-{location}{number}-{LOCATION} (e.g., cache-cph2320047-CPH)
+    if (/^cache-[a-z]{3}\d+-[A-Z]{3}$/.test(row.HTTPHeaders['x-served-by'])) {
+      row.CDN = 'Akamai';
+      return row;
+    }
+    // Fastly pattern: cache-{location}-{hash}-{LOCATION} (e.g., cache-fra-eddf8230040-FRA)
+    if (/^cache-[a-z]+-[a-z0-9]+-[A-Z]+$/.test(row.HTTPHeaders['x-served-by'])) {
+      row.CDN = 'Fastly';
+      return row;
+    }
+  }
+
+
+
+
+  unknownCDNS.push({ domain: row.Domain, ...row.HTTPHeaders });
+  row.CDN = 'Unknown CDN';
+  return row;
+}
 
 // drop the first line
 csvData.shift();
@@ -358,10 +508,11 @@ const cleaned = await Promise.all(csvData
     return l.Parent.localeCompare(r.Parent);
   })
   // begin the async stuff
-  .map(enrichDNS)
-  .map(enrichHTTPS)
-  .map(flagCDN)
-  .map(enrichHTML)
+  .map(row => limit(enrichDNS, row))
+  .map(row => limit(enrichHTTPS, row))
+  .map(flagCDNFromDNS)
+  .map(row => limit(enrichHTML, row))
+  .map(flagCDNFromHTTP)
 );
 
 function toTSV(arrOfObjects, columns) {
@@ -395,7 +546,16 @@ console.table(cleaned, columns);
 try {
   await fs.writeFile('out.json', JSON.stringify(cleaned, null, 2));
   await fs.writeFile('out.tsv', toTSV(cleaned, columns));
+  await fs.writeFile('unknown-cdns.json', JSON.stringify(unknownCDNS, null, 2));
 } catch (error) {
   console.error('Error writing to out.json:', error);
+} finally {
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (e) {
+      console.error('Error closing browser:', e.message);
+    }
+  }
 }
 
