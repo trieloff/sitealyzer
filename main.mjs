@@ -114,6 +114,7 @@ function flagDev(row) {
     'us-3.magentosite.cloud',
     'us-4.magentosite.cloud',
     'bxss.me',
+    'localhost',
   ];
   if (devParents.includes(row.Parent) || devParents.includes(row.TLD)) {
     row.Source = 'Excluded';
