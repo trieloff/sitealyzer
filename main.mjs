@@ -38,7 +38,7 @@ function readCSVFromStdin() {
       if (!headers) {
         headers = csvData.shift()
           .map(h => h.trim())
-          .map(h => h.replace(/url/, 'Domain'));
+          .map(h => h.replace(/^url$/, 'Domain'));
 
       }
     });
@@ -113,6 +113,7 @@ function flagDev(row) {
     'us-2.magentosite.cloud',
     'us-3.magentosite.cloud',
     'us-4.magentosite.cloud',
+    'bxss.me',
   ];
   if (devParents.includes(row.Parent) || devParents.includes(row.TLD)) {
     row.Source = 'Excluded';
@@ -176,6 +177,10 @@ async function flagCDNFromDNS(rowpromise) {
     },
     {
       pattern: '.edgekey.net',
+      cdn: 'Akamai'
+    },
+    {
+      pattern: '.akadns.net',
       cdn: 'Akamai'
     },
     {
@@ -305,9 +310,12 @@ async function flagCDNFromDNS(rowpromise) {
   if (!row.CDN && row.DNSError) {
     row.CDN = 'DNS Error';
   } else if (!row.CDN && row.DNS?.find(dns => dns.type === 'CNAME')) {
+    console.log('Unknown CDN with CNAME records', row.Domain, row.DNS);
     row.CDN = 'Unknown CDN ' + row.DNS.find(dns => dns.type === 'CNAME')?.value;
+  } else if (!row.CDN && row.DNS?.find(dns => dns.type === 'A')) {
+    console.log('Unknown CDN with A records', row.Domain, row.DNS);
+    row.CDN = 'Unknown CDN ' + row.DNS.find(dns => dns.type === 'A')?.value;
   }
-  delete row.DNS;
   return row;
 }
 
@@ -317,13 +325,14 @@ async function enrichHTTPS(rowpromise) {
     return row;
   }
 
-  const url = "https://" + row.Domain;
+  const url = row.topurl || "https://" + row.Domain;
+  let page;
 
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
 
     // Set shorter timeout and handle common errors
-    await page.setDefaultNavigationTimeout(15000);
+    await page.setDefaultNavigationTimeout(30000);
 
     // Configure request interception to handle protocol errors
     await page.setRequestInterception(true);
@@ -337,18 +346,42 @@ async function enrichHTTPS(rowpromise) {
       }
     });
 
-    const response = await page.goto(url, {
-      waitUntil: 'domcontentloaded', // Changed from networkidle2 for faster response
-      timeout: 15000,
-      followRedirect: true,
-    });
+    let response;
+    try {
+      response = await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+        followRedirect: true,
+      });
+    } catch (navigationError) {
+      if (navigationError.message.includes('Execution context was destroyed')) {
+        console.warn('Context destroyed during navigation:', url);
+        // Wait for any client-side redirects to complete
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 }).catch(() => { });
+        response = await page.goto(page.url(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } else {
+        throw navigationError;
+      }
+    }
 
     if (response) {
       row.HTTPStatus = response.status();
       row.HTTPHeaders = response.headers();
 
       if (row.HTTPStatus === 200) {
-        row.HTTPBody = await page.content();
+        try {
+          row.HTTPBody = await page.content();
+        } catch (contentError) {
+          if (contentError.message.includes('Execution context was destroyed')) {
+            console.warn('Context destroyed while fetching content:', url);
+            // Wait for any ongoing navigations to complete
+            await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 }).catch(() => { });
+            row.HTTPBody = await page.content();
+            row.HTTPError = 'Recovered from context destruction during content fetch';
+          } else {
+            throw contentError;
+          }
+        }
       }
     }
 
@@ -364,9 +397,16 @@ async function enrichHTTPS(rowpromise) {
     } else if (e.message.includes('net::ERR_CONNECTION_REFUSED')) {
       row.HTTPStatus = 503;
       row.HTTPError = 'Connection Refused';
+    } else if (e.message.includes('Execution context was destroyed')) {
+      row.HTTPStatus = 500;
+      row.HTTPError = 'Failed to recover from context destruction';
     } else {
       row.HTTPStatus = 500;
       row.HTTPError = e.message;
+    }
+  } finally {
+    if (page) {
+      await page.close().catch(e => console.warn('Error closing page:', e.message));
     }
   }
 
@@ -389,6 +429,10 @@ async function enrichHTML(rowpromise) {
   } else if (row.HTTPBody.match(/\/etc.clientlibs\//)) {
     row.Source = 'AEM';
     delete row.HTTPBody;
+  } else if (row.HTTPBody.match(/src="\/\.rum\/@adobe\/helix-rum-js/)) {
+    row.Source = 'AEM'; // only AEM CS uses the same host for RUM
+  } else if (row.HTTPBody.match(/ data-routing="program=/)) {
+    row.Source = 'AEM'; // for external hosts, AEM uses data-routing="program=
   } else if (row.HTTPBody.match(/\/\.rum\/@adobe\/helix-rum-js/)) {
     row.Source = 'RUM';
   } else {
@@ -470,13 +514,17 @@ async function flagCDNFromHTTP(rowpromise) {
 
   // Add x-served-by pattern detection
   if (row.HTTPHeaders?.['x-served-by']) {
+    // Split x-served-by on commas and check each value
+    const servedByValues = row.HTTPHeaders['x-served-by'].split(',').map(v => v.trim());
+
     // Akamai pattern: cache-{location}{number}-{LOCATION} (e.g., cache-cph2320047-CPH)
-    if (/^cache-[a-z]{3}\d+-[A-Z]{3}$/.test(row.HTTPHeaders['x-served-by'])) {
+    if (servedByValues.some(value => /^cache-[a-z]{3}\d+-[A-Z]{3}$/.test(value))) {
       row.CDN = 'Akamai';
       return row;
     }
+
     // Fastly pattern: cache-{location}-{hash}-{LOCATION} (e.g., cache-fra-eddf8230040-FRA)
-    if (/^cache-[a-z]+-[a-z0-9]+-[A-Z]+$/.test(row.HTTPHeaders['x-served-by'])) {
+    if (servedByValues.some(value => /^cache-[a-z]+-[a-z0-9]+-[A-Z]+$/.test(value))) {
       row.CDN = 'Fastly';
       return row;
     }
@@ -535,13 +583,17 @@ function toTSV(arrOfObjects, columns) {
 
 const columns = [
   'Domain',
+  'topurl',
+  'pageviews_k',
   'Parent',
   'Source',
   'CDN',
   'HTTPStatus',
   'Comment',
 ];
-console.table(cleaned, columns);
+console.table(cleaned
+  .filter(row => row.Source === 'Unverified' || row.Source === 'Other' || row.CDN === 'Unknown CDN' || row.HTTPStatus >= 400)
+  , columns);
 
 try {
   await fs.writeFile('out.json', JSON.stringify(cleaned, null, 2));

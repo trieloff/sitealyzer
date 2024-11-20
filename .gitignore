@@ -131,3 +131,7 @@ dist
 domains.tsv
 out.json
 out.tsv
+
+*.csv
+*.tsv
+unknown-cdns.json
