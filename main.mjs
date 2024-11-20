@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { createInterface } from 'readline';
 import psl from 'psl';
 import whoiser from 'whoiser';
 import dns from 'node:dns/promises';
@@ -8,6 +7,7 @@ import fs from 'fs/promises';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import pLimit from 'p-limit';
+import { readCSVFromStdin } from './utils.mjs';
 
 const limit = pLimit(5);
 await puppeteer.use(StealthPlugin());
@@ -21,36 +21,6 @@ const browser = await puppeteer.launch({
     '--ignore-certificate-errors',
   ]
 });
-
-function readCSVFromStdin() {
-  return new Promise((resolve) => {
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false
-    });
-
-    let headers;
-    let csvData = [];
-
-    rl.on('line', (line) => {
-      csvData.push(line.split(/[ \t,;]+/));
-      if (!headers) {
-        headers = csvData.shift()
-          .map(h => h.trim())
-          .map(h => h.replace(/^url$/, 'Domain'));
-
-      }
-    });
-
-    rl.on('close', () => {
-      resolve(csvData.map(row => row.reduce((acc, cur, i) => {
-        acc[headers[i]] = cur;
-        return acc;
-      }, {})));
-    });
-  });
-};
 
 const unknownCDNS = [];
 
@@ -115,8 +85,9 @@ function flagDev(row) {
     'us-4.magentosite.cloud',
     'bxss.me',
     'localhost',
+    'sharepoint.com',
   ];
-  if (devParents.includes(row.Parent) || devParents.includes(row.TLD)) {
+  if (devParents.includes(row.Parent) || devParents.includes(row.TLD) || row.Domain.includes('localhost')) {
     row.Source = 'Excluded';
     row.Comment = 'Development domain excluded';
   }
@@ -432,12 +403,16 @@ async function enrichHTML(rowpromise) {
     delete row.HTTPBody;
   } else if (row.HTTPBody.match(/src="\/\.rum\/@adobe\/helix-rum-js/)) {
     row.Source = 'AEM'; // only AEM CS uses the same host for RUM
+    delete row.HTTPBody;
   } else if (row.HTTPBody.match(/ data-routing="program=/)) {
     row.Source = 'AEM'; // for external hosts, AEM uses data-routing="program=
+    delete row.HTTPBody;
   } else if (row.HTTPBody.match(/\/\.rum\/@adobe\/helix-rum-js/)) {
     row.Source = 'RUM';
+    // we keep the body for RUM pages because they are useful for debugging
   } else {
     row.Source = 'Other';
+    // and we keep the body here, because it is necessary for debugging
   }
   return row;
 }
