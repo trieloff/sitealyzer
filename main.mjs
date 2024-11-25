@@ -2,6 +2,7 @@
 
 import psl from 'psl';
 import whoiser from 'whoiser';
+import { ip } from 'node-rdap';
 import dns from 'node:dns/promises';
 import fs from 'fs/promises';
 import puppeteer from 'puppeteer-extra';
@@ -74,6 +75,8 @@ function flagDev(row) {
     'aem.page',
     'aem.reviews',
     'aem.live',
+    'hlx.page',
+    'hlx.live',
     'adobeio-static.net',
     'adobeaemcloud.com',
     'adobe.pfizer',
@@ -94,6 +97,23 @@ function flagDev(row) {
   return row;
 }
 
+function flagStaging(row) {
+  if (
+    row.Domain.includes('staging')
+    || row.Domain.includes('stg')
+    || row.Domain.includes('stage')
+    || row.Domain.includes('preview')
+    || row.Domain.includes('beta')
+    || row.Domain.includes('test')
+    || row.Domain.includes('demo')
+    || row.Domain.includes('uat')
+  ) {
+    row.Source = 'Excluded';
+    row.Comment = 'Staging domain excluded';
+  }
+  return row;
+}
+
 function flagParent(row) {
   if (row.Source === 'Excluded') {
     return row;
@@ -109,9 +129,14 @@ async function enrichDNS(row) {
     return row;
   }
   try {
-    row.DNS = await dns.resolveAny(row.Domain);
+    row.DNS = (await dns.resolveCname(row.Domain)).map(cname => ({ type: 'CNAME', value: cname }));
   } catch (e) {
-    row.DNSError = e;
+    try {
+      // fallback to A records. We need to whois them to get the CDN
+      row.DNS = (await dns.resolve4(row.Domain)).map(ip => ({ type: 'A', value: ip }));
+    } catch (e) {
+      row.DNSError = e;
+    }
   }
   return row;
 }
@@ -143,6 +168,16 @@ async function flagCDNFromDNS(rowpromise) {
     return row;
   }
   const cdns = [
+    // NetName patterns
+    {
+      pattern: 'AIBV', // Akamai International BV
+      cdn: 'Akamai'
+    },
+    {
+      pattern: 'SKYCA-3',
+      cdn: 'Fastly'
+    },
+    // CNAME patterns
     {
       pattern: '.cdn.cloudflare.net',
       cdn: 'Cloudflare'
@@ -170,6 +205,10 @@ async function flagCDNFromDNS(rowpromise) {
     {
       pattern: '.adobeaemcloud.com',
       cdn: 'AEM Cloud Service'
+    },
+    {
+      pattern: 'hlxcdn.adobeaemcloud.com',
+      cdn: 'BYO DNS'
     },
     {
       pattern: '.cloudfront.net',
@@ -273,7 +312,11 @@ async function flagCDNFromDNS(rowpromise) {
     .filter(dns => dns.type === 'CNAME')
     .reduce((result, dns) => {
       if (result) return result;
-      const matchedCDN = cdns.find(cdn => dns.value.endsWith(cdn.pattern));
+      const matchedCDN = cdns.find(cdn =>
+        dns &&
+        dns.value &&
+        dns.value.endsWith &&
+        dns.value.endsWith(cdn.pattern));
       return matchedCDN ? matchedCDN.cdn : null;
     }, undefined);
   if (!row.CDN && row.HTTPHeaders && row.HTTPHeaders.server === 'cloudflare') {
@@ -281,11 +324,13 @@ async function flagCDNFromDNS(rowpromise) {
   }
   if (!row.CDN && row.DNSError) {
     row.CDN = 'DNS Error';
+  } else if (row.NetName) {
+    row.CDN = cdns.find(cdn => row.NetName.includes(cdn.pattern))?.cdn || 'Unknown CDN from NetName: ' + row.NetName;
   } else if (!row.CDN && row.DNS?.find(dns => dns.type === 'CNAME')) {
-    console.log('Unknown CDN with CNAME records', row.Domain, row.DNS);
+    console.warn('Unknown CDN with CNAME records', row.Domain, row.DNS);
     row.CDN = 'Unknown CDN ' + row.DNS.find(dns => dns.type === 'CNAME')?.value;
   } else if (!row.CDN && row.DNS?.find(dns => dns.type === 'A')) {
-    console.log('Unknown CDN with A records', row.Domain, row.DNS);
+    console.warn('Unknown CDN with A records', row.Domain, row.DNS);
     row.CDN = 'Unknown CDN ' + row.DNS.find(dns => dns.type === 'A')?.value;
   }
   return row;
@@ -385,7 +430,7 @@ async function enrichHTTPS(rowpromise) {
   return row;
 }
 
-async function enrichHTML(rowpromise) {
+async function flagFromHTML(rowpromise) {
   const row = await rowpromise;
   if (row.Source === 'Excluded') {
     return row;
@@ -514,6 +559,38 @@ async function flagCDNFromHTTP(rowpromise) {
   return row;
 }
 
+async function whois(a) {
+  // query ripe, lacnic, apnic, afrinic, and arin in parallel with whoiser
+  try {
+    const result = await ip(a);
+    return result.name;
+  } catch (e) {
+    console.warn('Error querying IP', a, e.message);
+    return null;
+  }
+}
+
+async function enrichARecords(rowpromise) {
+  const row = await rowpromise;
+  if (row.Source === 'Excluded' || !row.DNS) {
+    return row;
+  }
+  if (row.DNS.find(dns => dns.type === 'A')) {
+    row.NetName = (await Promise.all(row.DNS
+      .filter(dns => dns.type === 'A')
+      .map(dns => dns.value)
+      .map(a => whois(a))))
+      .join(',');
+    return row;
+  }
+  return row;
+}
+
+async function log(row) {
+  console.log(await row);
+  return row;
+}
+
 // drop the first line
 csvData.shift();
 
@@ -523,7 +600,9 @@ const cleaned = await Promise.all(csvData
   .map(flagIP)
   .map(flagParent)
   .map(flagDev)
-  // .filter(row => row.Source !== 'Excluded')
+  .map(flagStaging)
+  .filter(row => row.Source !== 'Excluded')
+
   //.slice(0, 1000)
   .sort((l, r) => {
     if (!l.Parent && !r.Parent) return 0;
@@ -531,11 +610,14 @@ const cleaned = await Promise.all(csvData
     if (!r.Parent) return -1;
     return l.Parent.localeCompare(r.Parent);
   })
+
   // begin the async stuff
   .map(row => limit(enrichDNS, row))
+  .map(row => limit(enrichARecords, row))
   .map(row => limit(enrichHTTPS, row))
   .map(flagCDNFromDNS)
-  .map(row => limit(enrichHTML, row))
+  .map(row => limit(flagFromHTML, row))
+  // .map(log)
   .map(flagCDNFromHTTP)
 );
 

@@ -135,3 +135,4 @@ out.tsv
 *.csv
 *.tsv
 unknown-cdns.json
+embeddings.json
