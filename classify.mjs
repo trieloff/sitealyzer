@@ -3,7 +3,7 @@
 import { readCSVFromStdin } from './utils.mjs';
 import fs from 'fs/promises';
 import levenshtein from 'js-levenshtein';
-
+import getOrgnameFromWhois from './whois.mjs';
 const csvData = await readCSVFromStdin();
 
 
@@ -83,6 +83,6 @@ console.log('domain\tprobability\tcustomer');
 // loop through the first 10 lines of csvData, classify each domain
 for (const line of csvData) {
   const domain = line.Parent || line.Domain;
-  const customer = await classifyDomain(domain);
+  const customer = await classifyDomain(domain + ' ' + await getOrgnameFromWhois(domain));
   console.log(`${domain}\t${customer}`);
 }

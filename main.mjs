@@ -90,7 +90,13 @@ function flagDev(row) {
     'localhost',
     'sharepoint.com',
   ];
-  if (devParents.includes(row.Parent) || devParents.includes(row.TLD) || row.Domain.includes('localhost')) {
+  if (devParents.includes(row.Parent)
+    || devParents.includes(row.TLD)
+    || row.Domain.includes('localhost')
+    || row.topurl?.includes('about:srcdoc')
+    || row.Domain.includes('.local')
+    || row.Domain.includes('docs.google.com')
+  ) {
     row.Source = 'Excluded';
     row.Comment = 'Development domain excluded';
   }
@@ -452,7 +458,14 @@ async function flagFromHTML(rowpromise) {
   } else if (row.HTTPBody.match(/ data-routing="program=/)) {
     row.Source = 'AEM'; // for external hosts, AEM uses data-routing="program=
     delete row.HTTPBody;
-  } else if (row.HTTPBody.match(/\/\.rum\/@adobe\/helix-rum-js/)) {
+  } else if (row.HTTPBody.match(/aem-GridColumn/)) {
+    row.Source = 'AEM'; // common core component
+    delete row.HTTPBody;
+  } else if (row.HTTPBody.match(/text\/x-magento-init/)) {
+    row.Source = 'Magento';
+    delete row.HTTPBody;
+  }
+  else if (row.HTTPBody.match(/\/\.rum\/@adobe\/helix-rum-js/)) {
     row.Source = 'RUM';
     // we keep the body for RUM pages because they are useful for debugging
   } else {
@@ -554,7 +567,7 @@ async function flagCDNFromHTTP(rowpromise) {
 
 
 
-  unknownCDNS.push({ domain: row.Domain, ...row.HTTPHeaders });
+  unknownCDNS.push({ domain: row.Domain, ...row.HTTPHeaders, DNS: row.DNS, NetName: row.NetName });
   row.CDN = 'Unknown CDN';
   return row;
 }
